@@ -1,0 +1,5 @@
+browser_profile/
+*.json
+*.xlsx
+.pipeline*/
+*.env
