@@ -5,22 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/proto"
 )
 
 const terminalPageDataLimit = 12_000
 
-const (
-	defaultRodWindowCount        = 10
-	maximumRodWindowCount        = 50
-	enrichmentCheckpointInterval = 10
-)
+const enrichmentCheckpointInterval = 10
 
 const (
 	linkedInPrimaryContentSelector = `section[aria-label="Primary content"]`
@@ -49,19 +42,6 @@ type linkedInScrollState struct {
 	TextLength    int  `json:"text_length"`
 }
 
-type enrichmentJob struct {
-	personIndex   int
-	platformIndex int
-	person        personCandidates
-}
-
-type enrichmentResult struct {
-	job      enrichmentJob
-	person   personCandidates
-	duration time.Duration
-	err      error
-}
-
 func enrichProfileCandidates(outputPath string) error {
 	document, found, err := readCandidateDocument(outputPath)
 	if err != nil {
@@ -71,197 +51,82 @@ func enrichProfileCandidates(outputPath string) error {
 		return fmt.Errorf("candidate file %s does not exist", outputPath)
 	}
 
-	var browser *rod.Browser
-	var loginPage *rod.Page
-	if hasProfileCandidates(document) {
-		browser, loginPage = openBrowser()
-		defer closeBrowserPagesAndBrowser(browser)
-		enableBrowserCaching(loginPage)
-	}
-
+	document.InstagramDataProvider = "browser_graphql_replay"
 	input := bufio.NewReader(os.Stdin)
-	if loginPage != nil {
-		if err := prepareBrowserLogins(loginPage, input, document); err != nil {
+	var page *rod.Page
+	if hasProfileCandidates(document) {
+		browser, loginPage := openBrowser()
+		defer closeBrowserPagesAndBrowser(browser)
+		page = loginPage
+		enableBrowserCaching(page)
+		if err := prepareBrowserLogins(page, input, document); err != nil {
 			return saveEnrichmentError(outputPath, document, "browser login", err)
 		}
-		// The login window is only a preflight step. Close it before starting the
-		// pool so the total number of browser windows never exceeds the limit.
-		if err := loginPage.Close(); err != nil {
-			Warnf("Unable to close browser login window: %v", err)
-		}
-		loginPage = nil
-	}
-	if browser == nil {
-		now := time.Now().UTC()
-		for index := range document.People {
-			document.People[index].EnrichmentComplete = true
-			document.People[index].EnrichedAt = &now
-		}
-		document.UpdatedAt = now
-		return writeCandidateDocument(outputPath, document)
 	}
 
-	remaining := make([]int, len(document.People))
-	totalJobs := 0
-	completed := 0
+	if page != nil {
+		// Reuse the login page for every platform and person; never open worker windows.
+		stopBlockingResources := startBrowserResourceBlocker(page)
+		defer stopBlockingResources()
+		Infof("Enriching profiles sequentially in one browser window")
+	}
+
+	pacer := &instagramPacer{}
+	var firstError error
 	for index := range document.People {
-		if len(document.People[index].InstagramCandidates) > 0 {
-			remaining[index]++
-			totalJobs++
-		}
-		if len(document.People[index].LinkedInCandidates) > 0 {
-			remaining[index]++
-			totalJobs++
-		}
-		if remaining[index] == 0 {
-			now := time.Now().UTC()
-			document.People[index].EnrichmentComplete = true
-			document.People[index].EnrichedAt = &now
-			completed++
-		}
-	}
-
-	windowCount := rodWindowCount()
-	if totalJobs < windowCount {
-		windowCount = totalJobs
-	}
-	Infof("Enriching %d independent platform job(s) with %d concurrent foreground browser window(s)", totalJobs, windowCount)
-	jobs := make(chan enrichmentJob)
-	results := make(chan enrichmentResult, windowCount)
-	var workers sync.WaitGroup
-	workers.Add(windowCount)
-	for range windowCount {
-		go func() {
-			defer workers.Done()
-			page, err := browser.Page(proto.TargetCreateTarget{
-				URL:        "about:blank",
-				NewWindow:  true,
-				Background: false,
-			})
-			if err != nil {
-				for job := range jobs {
-					results <- enrichmentResult{job: job, person: job.person, err: fmt.Errorf("open browser window: %w", err)}
-				}
-				return
+		person := &document.People[index]
+		person.EnrichmentComplete = false
+		person.EnrichedAt = nil
+		failed := false
+		for _, platform := range platforms {
+			if platform.site == "instagram.com" && len(person.InstagramCandidates) == 0 {
+				continue
 			}
-			defer page.Close()
+			if platform.site == "linkedin.com/in" && len(person.LinkedInCandidates) == 0 {
+				continue
+			}
 			if _, err := page.Activate(); err != nil {
 				Warnf("Unable to activate browser window: %v", err)
 			}
-			enableBrowserCaching(page)
-			stopBlockingResources := startBrowserResourceBlocker(page)
-			defer stopBlockingResources()
-			stopCapture, responses := startInstagramResponseCapture(page)
-			defer stopCapture()
-
-			for job := range jobs {
-				// This is the sole tab in its window. Re-activate it for every job so
-				// Chrome keeps the target in a foreground/visible lifecycle state.
-				if _, err := page.Activate(); err != nil {
-					Warnf("Unable to reactivate browser window: %v", err)
+			startedAt := time.Now()
+			printNameLogHeader(platform.name+" PAGE DATA", person.FullName, person.SourceRow, index+1, len(document.People))
+			var captureErr error
+			switch platform.site {
+			case "instagram.com":
+				captureErr = enrichInstagramCandidates(page, input, person, pacer)
+			case "linkedin.com/in":
+				captureErr = enrichLinkedInCandidates(page, input, person)
+			}
+			Infof("%s enrichment for %q finished in %s", platform.name, person.FullName, time.Since(startedAt).Round(time.Millisecond))
+			if captureErr != nil {
+				failed = true
+				if firstError == nil {
+					firstError = fmt.Errorf("enrich %s for %q: %w", platform.name, person.FullName, captureErr)
 				}
-				startedAt := time.Now()
-				person := job.person
-				platform := platforms[job.platformIndex]
-				printNameLogHeader(platform.name+" PAGE DATA", person.FullName, person.SourceRow, job.personIndex+1, len(document.People))
-				var err error
-				switch platform.site {
-				case "instagram.com":
-					err = enrichInstagramCandidates(page, responses, input, &person)
-				case "linkedin.com/in":
-					err = enrichLinkedInCandidates(page, input, &person)
-				}
-				results <- enrichmentResult{job: job, person: person, duration: time.Since(startedAt), err: err}
-			}
-		}()
-	}
-	go func() {
-		for index := range document.People {
-			person := document.People[index]
-			// Each platform job owns its candidate slice, avoiding shared writes
-			// while Instagram and LinkedIn for one person run simultaneously.
-			if len(person.InstagramCandidates) > 0 {
-				copyForJob := person
-				copyForJob.InstagramCandidates = append([]profileCandidate(nil), person.InstagramCandidates...)
-				jobs <- enrichmentJob{personIndex: index, platformIndex: 0, person: copyForJob}
-			}
-			if len(person.LinkedInCandidates) > 0 {
-				copyForJob := person
-				copyForJob.LinkedInCandidates = append([]profileCandidate(nil), person.LinkedInCandidates...)
-				jobs <- enrichmentJob{personIndex: index, platformIndex: 1, person: copyForJob}
 			}
 		}
-		close(jobs)
-		workers.Wait()
-		close(results)
-	}()
-
-	var firstError error
-	for result := range results {
-		platform := platforms[result.job.platformIndex]
-		Infof("%s enrichment for %q finished in %s", platform.name, result.person.FullName, result.duration.Round(time.Millisecond))
-		if result.err != nil {
-			if firstError == nil {
-				firstError = fmt.Errorf("enrich %s for %q: %w", platform.name, result.person.FullName, result.err)
-			}
-			continue
-		}
-		person := &document.People[result.job.personIndex]
-		switch platform.site {
-		case "instagram.com":
-			person.InstagramCandidates = result.person.InstagramCandidates
-		case "linkedin.com/in":
-			person.LinkedInCandidates = result.person.LinkedInCandidates
-		}
-		remaining[result.job.personIndex]--
-		if remaining[result.job.personIndex] == 0 {
-			now := time.Now().UTC()
+		now := time.Now().UTC()
+		if !failed {
 			person.EnrichmentComplete = personHasAllPageData(*person)
 			person.EnrichedAt = &now
-			document.UpdatedAt = now
-			completed++
-			if completed%enrichmentCheckpointInterval == 0 || completed == len(document.People) {
-				if err := writeCandidateDocument(outputPath, document); err != nil {
-					return fmt.Errorf("save enrichment for %q: %w", result.person.FullName, err)
-				}
-				Infof("Saved enrichment checkpoint for %d/%d people", completed, len(document.People))
+			Successf("Enriched candidates for %q (%d/%d)", person.FullName, index+1, len(document.People))
+		}
+		document.UpdatedAt = now
+		if (index+1)%enrichmentCheckpointInterval == 0 {
+			if err := writeCandidateDocument(outputPath, document); err != nil {
+				return fmt.Errorf("save enrichment for %q: %w", person.FullName, err)
 			}
-			Successf("Enriched candidates for %q (%d/%d)", result.person.FullName, completed, len(document.People))
+			Infof("Saved enrichment checkpoint for %d/%d people", index+1, len(document.People))
 		}
 	}
-	if firstError != nil {
-		document.UpdatedAt = time.Now().UTC()
-		if err := writeCandidateDocument(outputPath, document); err != nil {
+	document.UpdatedAt = time.Now().UTC()
+	if err := writeCandidateDocument(outputPath, document); err != nil {
+		if firstError != nil {
 			return fmt.Errorf("%v; save partial data: %w", firstError, err)
 		}
-		return firstError
+		return fmt.Errorf("save enrichment: %w", err)
 	}
-	return nil
-}
-
-func rodWindowCount() int {
-	value := strings.TrimSpace(os.Getenv("ROD_WINDOWS"))
-	variableName := "ROD_WINDOWS"
-	if value == "" {
-		// Retain compatibility with the earlier worker-pool setting.
-		value = strings.TrimSpace(os.Getenv("ROD_WORKERS"))
-		variableName = "ROD_WORKERS"
-	}
-	if value == "" {
-		Infof("Rod window configuration: ROD_WINDOWS is unset; using default %d", defaultRodWindowCount)
-		return defaultRodWindowCount
-	}
-	count, err := strconv.Atoi(value)
-	if err != nil || count < 1 {
-		Warnf("Invalid %s=%q; using %d", variableName, value, defaultRodWindowCount)
-		return defaultRodWindowCount
-	}
-	if count > maximumRodWindowCount {
-		Warnf("%s=%d exceeds the safety cap; using %d", variableName, count, maximumRodWindowCount)
-		return maximumRodWindowCount
-	}
-	Infof("Rod window configuration: %s=%q; using %d", variableName, value, count)
-	return count
+	return firstError
 }
 
 func prepareBrowserLogins(page *rod.Page, input *bufio.Reader, document candidateDocument) error {
@@ -270,7 +135,7 @@ func prepareBrowserLogins(page *rod.Page, input *bufio.Reader, document candidat
 		if profileURL == "" {
 			continue
 		}
-		Infof("Checking %s login before starting concurrent tabs", platform.name)
+		Infof("Checking %s login before capturing profiles", platform.name)
 		if err := page.Navigate(profileURL); err != nil {
 			return fmt.Errorf("open %s login check: %w", platform.name, err)
 		}
@@ -332,58 +197,61 @@ func personHasAllPageData(person personCandidates) bool {
 	return true
 }
 
-func enrichInstagramCandidates(
-	page *rod.Page,
-	responses <-chan instagramProfileResponse,
-	input *bufio.Reader,
-	person *personCandidates,
-) error {
+func enrichInstagramCandidates(page *rod.Page, input *bufio.Reader, person *personCandidates, pacer *instagramPacer) error {
+	if page == nil {
+		return fmt.Errorf("Instagram browser was not initialized")
+	}
 	Infof("Instagram candidates: %d", len(person.InstagramCandidates))
 	for index := range person.InstagramCandidates {
 		candidate := &person.InstagramCandidates[index]
-		Infof("Instagram candidate %d: %s — %s", index+1, candidate.URL, candidate.Title)
-		if page == nil {
-			return fmt.Errorf("Instagram browser was not initialized")
-		}
-
 		candidate.InstagramProfile = nil
 		candidate.InstagramCapturedAt = nil
 		candidate.InstagramCaptureError = ""
-		navigationStartedAt := time.Now()
-		if err := page.Navigate(candidate.URL); err != nil {
-			recordInstagramCaptureError(candidate, fmt.Errorf("navigate: %w", err))
-			continue
-		}
-		if err := page.WaitLoad(); err != nil {
-			recordInstagramCaptureError(candidate, fmt.Errorf("wait for load: %w", err))
-			continue
-		}
-		Infof("Instagram navigation/load for %q finished in %s", candidate.Username, time.Since(navigationStartedAt).Round(time.Millisecond))
-		loginStartedAt := time.Now()
-		if err := waitForLoginConfirmation(page, platforms[0], input); err != nil {
+		if err := pacer.wait(page.GetContext()); err != nil {
 			return err
 		}
-		Infof("Instagram login check for %q finished in %s", candidate.Username, time.Since(loginStartedAt).Round(time.Millisecond))
-
-		responseStartedAt := time.Now()
-		body, received := waitForInstagramProfileResponse(responses, person.FullName, candidate.URL)
-		Infof("Instagram profile-response wait for %q finished in %s", candidate.Username, time.Since(responseStartedAt).Round(time.Millisecond))
-		if !received {
-			recordInstagramCaptureError(candidate, fmt.Errorf("profile response was not captured"))
-			continue
-		}
-		profile, err := parseInstagramProfileResponse(body)
+		Infof("Instagram candidate %d: %s — %s", index+1, candidate.URL, candidate.Title)
+		profile, err := captureInstagramCandidate(page, input, person.FullName, candidate.URL)
+		pacer.observe(err, time.Now())
 		if err != nil {
-			recordInstagramCaptureError(candidate, fmt.Errorf("decode profile response: %w", err))
+			recordInstagramCaptureError(candidate, err)
+			// Stop page background traffic while the shared session cools down.
+			if blankErr := page.Navigate("about:blank"); blankErr != nil {
+				return fmt.Errorf("stop Instagram page after capture failure: %w", blankErr)
+			}
 			continue
 		}
 		now := time.Now().UTC()
 		candidate.InstagramProfile = profile
 		candidate.InstagramCapturedAt = &now
-		candidate.InstagramCaptureError = ""
 		logStructuredPageData("Instagram", profile)
 	}
 	return nil
+}
+
+func captureInstagramCandidate(page *rod.Page, input *bufio.Reader, name, profileURL string) (*instagramProfile, error) {
+	// Scope the response channel and deduplication to this candidate. No stale
+	// response or error from a previous profile can be attributed to this one.
+	stopReplay, responses := startInstagramReplayInterceptor(page)
+	defer stopReplay()
+	if err := page.Navigate(profileURL); err != nil {
+		return nil, fmt.Errorf("navigate: %w", err)
+	}
+	if err := page.WaitLoad(); err != nil {
+		return nil, fmt.Errorf("wait for load: %w", err)
+	}
+	if err := waitForLoginConfirmation(page, platforms[0], input); err != nil {
+		return nil, err
+	}
+	body, err := waitForInstagramProfileResponse(page.GetContext(), responses, name, profileURL)
+	if err != nil {
+		return nil, err
+	}
+	profile, err := parseInstagramProfileResponse(body)
+	if err != nil {
+		return nil, fmt.Errorf("decode profile response: %w", err)
+	}
+	return profile, nil
 }
 
 func recordInstagramCaptureError(candidate *profileCandidate, err error) {

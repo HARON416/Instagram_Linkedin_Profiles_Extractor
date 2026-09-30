@@ -2,9 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/ysmood/gson"
@@ -57,7 +63,7 @@ func TestReplayInstagramRequestPreservesCapturedRequest(t *testing.T) {
 	})}
 
 	responses := make(chan instagramProfileResponse, 1)
-	replayInstagramRequest(client, instagramGraphQLRequest{
+	replayInstagramRequest(context.Background(), client, instagramGraphQLRequest{
 		method: http.MethodPost,
 		url:    "https://www.instagram.com/api/graphql",
 		headers: http.Header{
@@ -114,7 +120,7 @@ func TestCompleteInstagramHeaders(t *testing.T) {
 	t.Parallel()
 
 	headers := http.Header{"Accept-Language": {"en-KE,en;q=0.9"}}
-	completeInstagramHeaders(nil, headers)
+	completeInstagramHeaders(headers, "en-US,en;q=0.9")
 
 	for header, expected := range map[string]string{
 		"Accept-Language": "en-KE,en;q=0.9",
@@ -129,44 +135,136 @@ func TestCompleteInstagramHeaders(t *testing.T) {
 	}
 }
 
-func TestDecodeNetworkResponseBody(t *testing.T) {
-	t.Parallel()
-
-	plain, err := decodeNetworkResponseBody(`{"plain":true}`, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := string(plain), `{"plain":true}`; got != want {
-		t.Fatalf("plain body = %q, want %q", got, want)
-	}
-
-	decoded, err := decodeNetworkResponseBody("eyJiYXNlNjQiOnRydWV9", true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := string(decoded), `{"base64":true}`; got != want {
-		t.Fatalf("decoded body = %q, want %q", got, want)
+func TestCompleteInstagramHeadersWithoutPage(t *testing.T) {
+	for _, language := range []string{"", "sw,en;q=0.9"} {
+		headers := make(http.Header)
+		completeInstagramHeaders(headers, language)
+		want := language
+		if want == "" {
+			want = "en-US,en;q=0.9"
+		}
+		if headers.Get("Accept-Language") != want {
+			t.Fatalf("language = %q", headers.Get("Accept-Language"))
+		}
 	}
 }
 
-func TestInstagramProfileGraphQLRequestMatcher(t *testing.T) {
-	t.Parallel()
+func TestInstagramReplayCancellationStopsInFlightRequest(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	responses := make(chan instagramProfileResponse, 1)
+	go func() {
+		defer close(done)
+		replayInstagramRequest(ctx, server.Client(), instagramGraphQLRequest{method: "GET", url: server.URL, headers: make(http.Header)}, responses)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replay did not stop after cancellation")
+	}
+	if len(responses) != 0 {
+		t.Fatal("canceled replay published a response")
+	}
+}
 
-	request := &proto.NetworkRequest{
-		URL: "https://www.instagram.com/api/graphql?doc_id=123",
-		Headers: proto.NetworkHeaders{
-			"x-fb-friendly-name": gson.New(instagramProfileQueryName),
-		},
+func TestInstagramHTTPFailuresReachCaptureImmediately(t *testing.T) {
+	for _, code := range []int{429, 401, 403, 500} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Retry-After", "120")
+				w.WriteHeader(code)
+			}))
+			defer server.Close()
+			responses := make(chan instagramProfileResponse, 1)
+			replayInstagramRequest(context.Background(), server.Client(), instagramGraphQLRequest{method: "GET", url: server.URL, headers: make(http.Header)}, responses)
+			// A buffered HTTP failure must be returned without waiting for the 30s timeout.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_, err := waitForInstagramProfileResponse(ctx, responses, "Example", "https://instagram.com/example/")
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprint(code)) {
+				t.Fatalf("unexpected HTTP error: %v", err)
+			}
+			if code == 429 {
+				var limited *instagramRateLimitError
+				if !errors.As(err, &limited) || limited.retryAfter != 2*time.Minute {
+					t.Fatalf("lost retry metadata: %v", err)
+				}
+			}
+		})
 	}
-	if !isInstagramProfileGraphQLRequest(request, proto.NetworkResourceTypeFetch) {
-		t.Fatal("expected the profile GraphQL request to match")
-	}
-	if isInstagramProfileGraphQLRequest(request, proto.NetworkResourceTypeImage) {
-		t.Fatal("did not expect an image request to match")
-	}
+}
 
-	request.Headers["x-fb-friendly-name"] = gson.New("DifferentQuery")
-	if isInstagramProfileGraphQLRequest(request, proto.NetworkResourceTypeFetch) {
-		t.Fatal("did not expect a different GraphQL query to match")
+func TestInstagramCooldownPersistsAndRespectsRetryAfter(t *testing.T) {
+	now := time.Now()
+	pacer := &instagramPacer{}
+	for _, want := range []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
+		err := &instagramRateLimitError{}
+		pacer.observe(err, now)
+		if pacer.next.Sub(now) != want || err.retryAfter != want {
+			t.Fatalf("cooldown = %s, want %s", pacer.next.Sub(now), want)
+		}
+	}
+	pacer.observe(&instagramRateLimitError{retryAfter: 20 * time.Minute}, now)
+	if pacer.next.Sub(now) != 20*time.Minute {
+		t.Fatal("server cooldown was shortened")
+	}
+	pacer.observe(nil, now)
+	if pacer.strikes != 0 {
+		t.Fatal("success did not reset escalation")
+	}
+}
+
+func TestInstagramPacingAndCancellation(t *testing.T) {
+	pacer := &instagramPacer{}
+	before := time.Now()
+	if err := pacer.wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if pacer.next.Before(before.Add(5 * time.Second)) {
+		t.Fatal("next profile was not paced")
+	}
+	next := pacer.next
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := pacer.wait(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("wait error = %v", err)
+	}
+	if pacer.next != next {
+		t.Fatal("cancellation changed pacing state")
+	}
+}
+
+func TestInstagramCaptureReportsTransportAndProfileErrors(t *testing.T) {
+	for _, response := range []instagramProfileResponse{
+		{err: fmt.Errorf("transport failed")},
+		{statusCode: 200, body: []byte(`not json`)},
+		{statusCode: 200, body: []byte(`{"data":{"user":{"username":"different"}}}`)},
+	} {
+		responses := make(chan instagramProfileResponse, 1)
+		responses <- response
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := waitForInstagramProfileResponse(ctx, responses, "Example", "https://instagram.com/example/")
+		cancel()
+		if err == nil || errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected immediate capture failure: %v", err)
+		}
+	}
+	responses := make(chan instagramProfileResponse, 1)
+	responses <- instagramProfileResponse{statusCode: 200, body: []byte(`{"data":{"user":{"username":"example"}}}`)}
+	if _, err := waitForInstagramProfileResponse(context.Background(), responses, "Example", "https://instagram.com/example/"); err != nil {
+		t.Fatal(err)
 	}
 }

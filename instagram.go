@@ -2,13 +2,15 @@ package main
 
 import (
 	"bytes"
-	"encoding/base64"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -23,7 +25,64 @@ const (
 	instagramMaxResponseSize     = 16 << 20
 )
 
+type instagramRateLimitError struct{ retryAfter time.Duration }
+
+func (e *instagramRateLimitError) Error() string {
+	return fmt.Sprintf("Instagram rate-limited the request (HTTP 429); cooldown %s", e.retryAfter.Round(time.Second))
+}
+
+// One instance is shared by every Instagram candidate in a run.
+// The navigation goroutine owns this state; replay workers never access it.
+type instagramPacer struct {
+	next    time.Time
+	strikes int
+}
+
+func (p *instagramPacer) wait(ctx context.Context) error {
+	if delay := time.Until(p.next); delay > 0 {
+		Infof("Pausing Instagram requests for %s", delay.Round(time.Second))
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.next = time.Now().Add(5 * time.Second)
+	return nil
+}
+
+func (p *instagramPacer) observe(err error, now time.Time) {
+	var limited *instagramRateLimitError
+	if errors.As(err, &limited) {
+		delay := time.Minute
+		for i := 0; i < p.strikes && delay < 5*time.Minute; i++ {
+			delay *= 2
+		}
+		if delay > 5*time.Minute {
+			delay = 5 * time.Minute
+		}
+		if p.strikes < 4 {
+			p.strikes++
+		}
+		// A server-provided delay is never shortened to our fallback cap.
+		if limited.retryAfter > delay {
+			delay = limited.retryAfter
+		}
+		limited.retryAfter = delay
+		p.next = now.Add(delay)
+	} else if err == nil {
+		p.strikes = 0
+	}
+}
+
 type instagramProfileResponse struct {
+	err        error
+	retryAfter time.Duration
 	statusCode int
 	body       []byte
 }
@@ -97,8 +156,7 @@ func enableBrowserCaching(page *rod.Page) {
 }
 
 func startBrowserResourceBlocker(page *rod.Page) func() {
-	// Native CDP blocking preserves Chrome's cache. Rod request hijacking would
-	// disable the cache for the entire page, defeating the larger optimization.
+	// Block heavy resources through CDP independently of GraphQL request replay.
 	patterns := []string{
 		"*.jpg*", "*.jpeg*", "*.png*", "*.gif*", "*.webp*", "*.avif*", "*.svg*", "*.ico*",
 		"*.mp4*", "*.webm*", "*.mov*", "*.avi*",
@@ -118,94 +176,23 @@ func startBrowserResourceBlocker(page *rod.Page) func() {
 	}
 }
 
-func startInstagramResponseCapture(page *rod.Page) (func(), <-chan instagramProfileResponse) {
-	responses := make(chan instagramProfileResponse, 4)
-	matchedRequests := make(map[proto.NetworkRequestID]struct{})
-	responseStatuses := make(map[proto.NetworkRequestID]int)
-	capturePage, cancel := page.WithCancel()
-
-	wait := capturePage.EachEvent(
-		func(event *proto.NetworkRequestWillBeSent) {
-			if !isInstagramProfileGraphQLRequest(event.Request, event.Type) {
-				return
-			}
-			matchedRequests[event.RequestID] = struct{}{}
-		},
-		func(event *proto.NetworkResponseReceived) {
-			if _, matched := matchedRequests[event.RequestID]; !matched {
-				return
-			}
-			responseStatuses[event.RequestID] = event.Response.Status
-		},
-		func(event *proto.NetworkLoadingFinished) {
-			if _, matched := matchedRequests[event.RequestID]; !matched {
-				return
-			}
-			delete(matchedRequests, event.RequestID)
-			statusCode := responseStatuses[event.RequestID]
-			delete(responseStatuses, event.RequestID)
-
-			body, err := readNetworkResponseBody(capturePage, event.RequestID)
-			if err != nil {
-				Warnf("Unable to capture Instagram response body: %v", err)
-				return
-			}
-
-			select {
-			case responses <- instagramProfileResponse{statusCode: statusCode, body: body}:
-			default:
-			}
-		},
-		func(event *proto.NetworkLoadingFailed) {
-			delete(matchedRequests, event.RequestID)
-			delete(responseStatuses, event.RequestID)
-		},
-	)
-	go wait()
-
-	return cancel, responses
-}
-
-func isInstagramProfileGraphQLRequest(request *proto.NetworkRequest, resourceType proto.NetworkResourceType) bool {
-	if request == nil {
-		return false
-	}
-	if resourceType != proto.NetworkResourceTypeXHR && resourceType != proto.NetworkResourceTypeFetch {
-		return false
-	}
-	if !strings.HasPrefix(request.URL, "https://www.instagram.com/api/graphql") {
-		return false
-	}
-	return hasHeaderValue(request.Headers, "x-fb-friendly-name", instagramProfileQueryName)
-}
-
-func readNetworkResponseBody(page *rod.Page, requestID proto.NetworkRequestID) ([]byte, error) {
-	result, err := proto.NetworkGetResponseBody{RequestID: requestID}.Call(page)
-	if err != nil {
-		return nil, err
-	}
-	return decodeNetworkResponseBody(result.Body, result.Base64Encoded)
-}
-
-func decodeNetworkResponseBody(value string, base64Encoded bool) ([]byte, error) {
-	body := []byte(value)
-	var err error
-	if base64Encoded {
-		body, err = base64.StdEncoding.DecodeString(value)
-		if err != nil {
-			return nil, fmt.Errorf("decode base64 response: %w", err)
+// startInstagramReplayInterceptor captures the browser's current profile GraphQL
+// request and replays it through Go using the active session and request payload.
+func startInstagramReplayInterceptor(page *rod.Page) (func(), <-chan instagramProfileResponse) {
+	// Read page JavaScript only on the navigation goroutine, before interception.
+	acceptLanguage := "en-US,en;q=0.9"
+	if result, err := page.Eval(`() => navigator.languages.join(",")`); err == nil {
+		if languages := result.Value.Str(); languages != "" {
+			acceptLanguage = formatAcceptLanguage(languages)
 		}
 	}
-	if len(body) > instagramMaxResponseSize {
-		return nil, fmt.Errorf("response exceeds %d bytes", instagramMaxResponseSize)
-	}
-	return body, nil
-}
+	replayContext, cancel := context.WithCancel(page.GetContext())
+	replayPage := page.Context(replayContext)
+	var lifecycle sync.Mutex
+	var workers sync.WaitGroup
+	stopping := false
+	replayStarted := false
 
-// startInstagramReplayInterceptor is retained as a disabled fallback. It
-// duplicates Instagram's browser request through Go's HTTP stack and can be
-// re-enabled from main.go if direct CDP response capture stops working.
-func startInstagramReplayInterceptor(page *rod.Page) (*rod.HijackRouter, <-chan instagramProfileResponse) {
 	responses := make(chan instagramProfileResponse, 4)
 	router := page.HijackRequests()
 	client := &http.Client{
@@ -238,21 +225,40 @@ func startInstagramReplayInterceptor(page *rod.Page) (*rod.HijackRouter, <-chan 
 		// finish its original request unchanged, and replay our private copy in a
 		// separate goroutine.
 		ctx.ContinueRequest(&proto.FetchContinueRequest{})
+		lifecycle.Lock()
+		if stopping || replayStarted {
+			lifecycle.Unlock()
+			return
+		}
+		replayStarted = true
+		workers.Add(1)
+		lifecycle.Unlock()
 		go func() {
+			defer workers.Done()
 			// Fetch.requestPaused doesn't always expose Cookie. Ask Chrome for the
 			// cookies that apply to this exact URL so the replay uses the active login.
-			if cookies, err := page.Cookies([]string{captured.url}); err == nil {
+			if cookies, err := replayPage.Cookies([]string{captured.url}); err == nil {
 				if cookie := cookieHeader(cookies); cookie != "" {
 					captured.headers.Set("Cookie", cookie)
 				}
 			}
-			completeInstagramHeaders(page, captured.headers)
-			replayInstagramRequest(client, captured, responses)
+			completeInstagramHeaders(captured.headers, acceptLanguage)
+			replayInstagramRequest(replayContext, client, captured, responses)
 		}()
 	})
 
 	go router.Run()
-	return router, responses
+	return func() {
+		lifecycle.Lock()
+		stopping = true
+		lifecycle.Unlock()
+		cancel()
+		if err := router.Stop(); err != nil {
+			Warnf("Unable to stop Instagram GraphQL interceptor: %v", err)
+		}
+		workers.Wait()
+		client.CloseIdleConnections()
+	}, responses
 }
 
 func cloneInstagramHeaders(headers proto.NetworkHeaders) http.Header {
@@ -271,23 +277,17 @@ func cookieHeader(cookies []*proto.NetworkCookie) string {
 	return strings.Join(parts, "; ")
 }
 
-func completeInstagramHeaders(page *rod.Page, headers http.Header) {
+// completeInstagramHeaders is pure: replay workers must never evaluate page
+// JavaScript concurrently with navigation or Rod's WaitLoad helper.
+func completeInstagramHeaders(headers http.Header, acceptLanguage string) {
 	setHeaderIfMissing(headers, "Priority", "u=1, i")
 	setHeaderIfMissing(headers, "Sec-Fetch-Dest", "empty")
 	setHeaderIfMissing(headers, "Sec-Fetch-Mode", "cors")
 	setHeaderIfMissing(headers, "Sec-Fetch-Site", "same-origin")
-
-	if headers.Get("Accept-Language") != "" {
-		return
+	if acceptLanguage == "" {
+		acceptLanguage = "en-US,en;q=0.9"
 	}
-
-	acceptLanguage := "en-US,en;q=0.9"
-	if result, err := page.Eval(`() => navigator.languages.join(",")`); err == nil {
-		if browserLanguages := result.Value.Str(); browserLanguages != "" {
-			acceptLanguage = formatAcceptLanguage(browserLanguages)
-		}
-	}
-	headers.Set("Accept-Language", acceptLanguage)
+	setHeaderIfMissing(headers, "Accept-Language", acceptLanguage)
 }
 
 func setHeaderIfMissing(headers http.Header, name, value string) {
@@ -318,60 +318,51 @@ func formatAcceptLanguage(browserLanguages string) string {
 }
 
 func replayInstagramRequest(
+	ctx context.Context,
 	client *http.Client,
 	captured instagramGraphQLRequest,
 	responses chan<- instagramProfileResponse,
 ) {
-	request, err := http.NewRequest(captured.method, captured.url, bytes.NewReader(captured.body))
+
+	publish := func(result instagramProfileResponse) {
+		if ctx.Err() != nil {
+			return
+		}
+		select {
+		case responses <- result:
+		case <-ctx.Done():
+		}
+	}
+	request, err := http.NewRequestWithContext(ctx, captured.method, captured.url, bytes.NewReader(captured.body))
 	if err != nil {
-		Errorf("Instagram replay failed: prepare request: %v", err)
+		publish(instagramProfileResponse{err: fmt.Errorf("prepare Instagram replay: %w", err)})
 		return
 	}
 	request.Header = captured.headers.Clone()
-	// These are managed by net/http. In particular, allowing Go to negotiate
-	// compression avoids receiving a Brotli body that it cannot decode itself.
 	request.Header.Del("Accept-Encoding")
 	request.Header.Del("Content-Length")
 	request.ContentLength = int64(len(captured.body))
-
 	response, err := client.Do(request)
 	if err != nil {
-		Errorf("Instagram replay failed: send request: %v", err)
+		publish(instagramProfileResponse{err: fmt.Errorf("send Instagram replay: %w", err)})
 		return
 	}
 	defer response.Body.Close()
-
+	// Publish HTTP failures without waiting for a body that may be empty or slow.
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		publish(instagramProfileResponse{statusCode: response.StatusCode, retryAfter: parseRetryAfter(response.Header.Get("Retry-After"))})
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, instagramMaxResponseSize+1))
 	if err != nil {
-		Errorf("Instagram replay failed: read response: %v", err)
+		publish(instagramProfileResponse{err: fmt.Errorf("read Instagram replay: %w", err)})
 		return
 	}
 	if len(body) > instagramMaxResponseSize {
-		Errorf("Instagram replay failed: response exceeds %d bytes", instagramMaxResponseSize)
+		publish(instagramProfileResponse{err: fmt.Errorf("Instagram response exceeds %d bytes", instagramMaxResponseSize)})
 		return
 	}
-
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		retryAfter := response.Header.Get("Retry-After")
-		if retryAfter == "" {
-			retryAfter = "not provided"
-		}
-		Errorf(
-			"Instagram replay returned HTTP %d (Retry-After: %s): %s",
-			response.StatusCode,
-			retryAfter,
-			compactInstagramError(body),
-		)
-	}
-
-	result := instagramProfileResponse{
-		statusCode: response.StatusCode,
-		body:       body,
-	}
-	select {
-	case responses <- result:
-	default:
-	}
+	publish(instagramProfileResponse{statusCode: response.StatusCode, body: body})
 }
 
 func compactInstagramError(body []byte) string {
@@ -395,34 +386,40 @@ func hasHeaderValue(headers proto.NetworkHeaders, name, expected string) bool {
 	return false
 }
 
-func waitForInstagramProfileResponse(responses <-chan instagramProfileResponse, name, profileURL string) ([]byte, bool) {
+func waitForInstagramProfileResponse(ctx context.Context, responses <-chan instagramProfileResponse, name, profileURL string) ([]byte, error) {
 	expectedUsername, err := instagramUsernameFromURL(profileURL)
 	if err != nil {
-		Warnf("Unable to identify the Instagram username for %q", name)
-		return nil, false
+		return nil, err
 	}
-
 	timer := time.NewTimer(instagramResponseWaitTimeout)
 	defer timer.Stop()
-
-	for {
-		select {
-		case response := <-responses:
-			if response.statusCode < http.StatusOK || response.statusCode >= http.StatusMultipleChoices {
-				continue
-			}
-
-			responseUsername, err := instagramUsernameFromResponse(response.body)
-			if err != nil || !strings.EqualFold(responseUsername, expectedUsername) {
-				continue
-			}
-
-			Successf("Captured Instagram profile data for %q (%d bytes)", name, len(response.body))
-			return response.body, true
-		case <-timer.C:
-			Warnf("Instagram profile data was not received for %q", name)
-			return nil, false
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case response, ok := <-responses:
+		if !ok {
+			return nil, fmt.Errorf("Instagram capture stopped before receiving a response")
 		}
+		if response.err != nil {
+			return nil, response.err
+		}
+		if response.statusCode == http.StatusTooManyRequests {
+			return nil, &instagramRateLimitError{retryAfter: response.retryAfter}
+		}
+		if response.statusCode < 200 || response.statusCode >= 300 {
+			return nil, fmt.Errorf("Instagram replay returned HTTP %d", response.statusCode)
+		}
+		responseUsername, err := instagramUsernameFromResponse(response.body)
+		if err != nil {
+			return nil, fmt.Errorf("decode Instagram response: %w", err)
+		}
+		if !strings.EqualFold(responseUsername, expectedUsername) {
+			return nil, fmt.Errorf("Instagram returned a response for a different profile")
+		}
+		Successf("Captured Instagram profile data for %q (%d bytes)", name, len(response.body))
+		return response.body, nil
+	case <-timer.C:
+		return nil, fmt.Errorf("Instagram profile request was not received within %s", instagramResponseWaitTimeout)
 	}
 }
 

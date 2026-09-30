@@ -79,7 +79,7 @@ func openBrowser() (*rod.Browser, *rod.Page) {
 	page := browser.MustPage("about:blank").MustWindowMaximize()
 	closeRestoredAutomationPages(browser, page)
 
-	//time.Sleep(5 * time.Minute)
+	//time.Sleep(5000 * time.Minute)
 
 	return browser, page
 }

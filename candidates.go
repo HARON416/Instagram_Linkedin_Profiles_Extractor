@@ -37,31 +37,28 @@ type candidateDocument struct {
 	LinkedInDataProvider  string             `json:"linkedin_data_provider"`
 	MatchingProvider      string             `json:"matching_provider,omitempty"`
 	MatchingModel         string             `json:"matching_model,omitempty"`
+	MatchThreshold        float64            `json:"match_threshold,omitempty"`
 	People                []personCandidates `json:"people"`
 }
 
 type personCandidates struct {
-	SourceRow             int                `json:"source_row"`
-	FirstName             string             `json:"first_name"`
-	LastName              string             `json:"last_name"`
-	FullName              string             `json:"full_name"`
-	InstagramCandidates   []profileCandidate `json:"instagram_candidates"`
-	LinkedInCandidates    []profileCandidate `json:"linkedin_candidates"`
-	Complete              bool               `json:"complete"`
-	SearchedAt            *time.Time         `json:"searched_at,omitempty"`
-	EnrichmentComplete    bool               `json:"enrichment_complete,omitempty"`
-	EnrichedAt            *time.Time         `json:"enriched_at,omitempty"`
-	MatchStatus           string             `json:"match_status,omitempty"`
-	BestInstagramURL      string             `json:"best_instagram_url,omitempty"`
-	BestMatchScore        *int               `json:"best_match_score,omitempty"`
-	MatchDecision         string             `json:"match_decision,omitempty"`
-	MatchSummary          string             `json:"match_summary,omitempty"`
-	ManualReview          bool               `json:"manual_review,omitempty"`
-	BaselineNameSupported bool               `json:"baseline_name_supported,omitempty"`
-	BaselineReason        string             `json:"baseline_reason,omitempty"`
-	GeminiModel           string             `json:"gemini_model,omitempty"`
-	GeminiError           string             `json:"gemini_error,omitempty"`
-	AnalyzedAt            *time.Time         `json:"analyzed_at,omitempty"`
+	SourceRow           int                `json:"source_row"`
+	FirstName           string             `json:"first_name"`
+	LastName            string             `json:"last_name"`
+	FullName            string             `json:"full_name"`
+	InstagramCandidates []profileCandidate `json:"instagram_candidates"`
+	LinkedInCandidates  []profileCandidate `json:"linkedin_candidates"`
+	Complete            bool               `json:"complete"`
+	SearchedAt          *time.Time         `json:"searched_at,omitempty"`
+	EnrichmentComplete  bool               `json:"enrichment_complete,omitempty"`
+	EnrichedAt          *time.Time         `json:"enriched_at,omitempty"`
+	MatchStatus         string             `json:"match_status,omitempty"`
+	BestInstagramURL    string             `json:"best_instagram_url,omitempty"`
+	BestMatchScore      *float64           `json:"best_match_score,omitempty"`
+	Match               *bool              `json:"match,omitempty"`
+	MatchModel          string             `json:"match_model,omitempty"`
+	MatchError          string             `json:"match_error,omitempty"`
+	AnalyzedAt          *time.Time         `json:"analyzed_at,omitempty"`
 }
 
 func discoverProfileCandidates(
@@ -84,7 +81,7 @@ func discoverProfileCandidatesWithCallback(
 		UpdatedAt:             now,
 		SourceWorkbook:        namesWorkbookPath,
 		SearchProvider:        "tinyfish_search",
-		InstagramDataProvider: "browser_cdp_response",
+		InstagramDataProvider: "browser_graphql_replay",
 		LinkedInDataProvider:  "browser_rod_rendered_primary_content",
 		People:                make([]personCandidates, len(records)),
 	}

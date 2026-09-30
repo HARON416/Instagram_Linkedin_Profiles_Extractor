@@ -157,22 +157,3 @@ func TestDiscoverProfileCandidatesSearchesEachPersonInstagramThenLinkedIn(t *tes
 		t.Fatalf("request order = %#v, want %#v", requests, want)
 	}
 }
-
-func TestRodWindowCount(t *testing.T) {
-	t.Setenv("ROD_WINDOWS", "7")
-	if got := rodWindowCount(); got != 7 {
-		t.Fatalf("rodWindowCount() = %d, want 7", got)
-	}
-	t.Setenv("ROD_WINDOWS", "100")
-	if got := rodWindowCount(); got != maximumRodWindowCount {
-		t.Fatalf("capped rodWindowCount() = %d, want %d", got, maximumRodWindowCount)
-	}
-}
-
-func TestRodWindowCountUsesSafeDefault(t *testing.T) {
-	t.Setenv("ROD_WINDOWS", "")
-	t.Setenv("ROD_WORKERS", "")
-	if got := rodWindowCount(); got != 10 {
-		t.Fatalf("default rodWindowCount() = %d, want 10", got)
-	}
-}

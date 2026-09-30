@@ -17,7 +17,7 @@ var loginConfirmationMu sync.Mutex
 
 const (
 	namesWorkbookPath = "names.xlsx"
-	maximumTestNames  = 1000000
+	maximumTestNames  = 50
 )
 
 type platformSearch struct {
@@ -53,12 +53,12 @@ func main() {
 		Errorf("Unable to configure TinyFish Search: %v", err)
 		os.Exit(1)
 	}
-	matcher, err := newGeminiProfileMatcherFromEnv(ctx)
+	matcher, err := newJevProfileMatcherFromEnv()
 	if err != nil {
-		Errorf("Unable to configure Gemini profile matching: %v", err)
+		Errorf("Unable to configure Jev profile matching: %v", err)
 		os.Exit(1)
 	}
-	Infof("Gemini profile matching model: %s", matcher.Model())
+	Infof("Jev profile matching model: %s", matcher.Model())
 
 	records, err := readNameRecords(namesWorkbookPath)
 	if err != nil {
@@ -89,10 +89,10 @@ func main() {
 	matchingStartedAt := time.Now()
 	document, err := analyzeProfileMatches(ctx, matcher, candidatesOutputPath)
 	if err != nil {
-		Errorf("Unable to complete Gemini profile matching: %v", err)
+		Errorf("Unable to complete Jev profile matching: %v", err)
 		os.Exit(1)
 	}
-	Successf("Gemini profile matching results saved to %s in %s", candidatesOutputPath, time.Since(matchingStartedAt).Round(time.Millisecond))
+	Successf("Jev profile matching results saved to %s in %s", candidatesOutputPath, time.Since(matchingStartedAt).Round(time.Millisecond))
 	if err := writeMatchWorkbook(matchesWorkbookPath, document); err != nil {
 		Errorf("Unable to write profile match workbook: %v", err)
 		os.Exit(1)

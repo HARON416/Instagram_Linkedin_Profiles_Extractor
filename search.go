@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,6 +31,7 @@ type tinyFishSearchClient struct {
 	language    string
 	httpClient  *http.Client
 	rateLimiter *rollingWindowLimiter
+	retrySleep  func(time.Duration)
 }
 
 // rollingWindowLimiter counts actual HTTP attempts (including retries), so a
@@ -172,21 +175,42 @@ func (client *tinyFishSearchClient) search(query, purpose, includeDomain string)
 		if err == nil {
 			return response, nil
 		}
-		if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable {
+		if !retryableSearchError(status, err) {
 			return tinyFishSearchResponse{}, err
 		}
 		if attempt == searchMaximumAttempts-1 {
-			return tinyFishSearchResponse{}, err
+			return tinyFishSearchResponse{}, fmt.Errorf("TinyFish Search failed after %d attempts: %w", searchMaximumAttempts, err)
 		}
 
 		if retryAfter <= 0 {
 			retryAfter = time.Duration(1<<attempt) * time.Second
 		}
-		Warnf("TinyFish Search returned HTTP %d; retrying in %s", status, retryAfter)
-		time.Sleep(retryAfter)
+		Warnf("TinyFish Search attempt %d/%d failed: %v; retrying in %s", attempt+1, searchMaximumAttempts, err, retryAfter)
+		if client.retrySleep != nil {
+			client.retrySleep(retryAfter)
+		} else {
+			time.Sleep(retryAfter)
+		}
 	}
 
 	return tinyFishSearchResponse{}, fmt.Errorf("TinyFish Search failed with HTTP %d", lastStatus)
+}
+
+// Search uses GET, so retrying a transient failure does not mutate remote state.
+func retryableSearchError(status int, err error) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	// Do not retry authentication, request validation, or invalid JSON responses.
+	if status != 0 && status != http.StatusOK {
+		return false
+	}
+	var networkError net.Error
+	return (errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary())) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func (client *tinyFishSearchClient) waitForRateLimit() {

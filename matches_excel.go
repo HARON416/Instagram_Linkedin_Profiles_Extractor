@@ -17,15 +17,13 @@ var matchHeaders = []interface{}{
 	"LINKEDIN PROFILE",
 	"INSTAGRAM PROFILE",
 	"SCORE",
-	"RESULT",
-	"WHY",
-	"NEEDS REVIEW",
+	"MATCH",
 }
 
 var runDetailsHeaders = []interface{}{
 	"NAME",
 	"STATUS",
-	"GEMINI MODEL",
+	"MODEL",
 	"ANALYZED AT",
 	"ANALYSIS ERROR",
 }
@@ -79,22 +77,21 @@ func writeMatchWorkbook(path string, document candidateDocument) error {
 		linkedInURL := firstLinkedInURL(person)
 		bestScore := any("")
 		if person.BestMatchScore != nil {
-			bestScore = float64(*person.BestMatchScore) / 100
+			bestScore = *person.BestMatchScore
 		}
 
+		matchValue := ""
+		if person.Match != nil {
+			matchValue = yesNo(*person.Match)
+		}
 		matchValues := []interface{}{
 			person.FullName,
 			linkedInURL,
 			person.BestInstagramURL,
 			bestScore,
-			friendlyMatchDecision(person.MatchDecision),
-			person.MatchSummary,
-			yesNo(person.ManualReview),
+			matchValue,
 		}
 		if err := file.SetSheetRow(matchesSheet, fmt.Sprintf("A%d", row), &matchValues); err != nil {
-			return err
-		}
-		if err := addBlankOverflowBlockers(file, matchesSheet, row, matchValues); err != nil {
 			return err
 		}
 		for column, target := range map[string]string{
@@ -116,9 +113,9 @@ func writeMatchWorkbook(path string, document candidateDocument) error {
 		runDetails := []interface{}{
 			person.FullName,
 			friendlyMatchStatus(person.MatchStatus),
-			person.GeminiModel,
+			person.MatchModel,
 			analyzedAt,
-			person.GeminiError,
+			person.MatchError,
 		}
 		if err := file.SetSheetRow(runDetailsSheet, fmt.Sprintf("A%d", row), &runDetails); err != nil {
 			return err
@@ -141,8 +138,6 @@ func writeMatchWorkbook(path string, document candidateDocument) error {
 		{matchesSheet, "B", "C", 38},
 		{matchesSheet, "D", "D", 18},
 		{matchesSheet, "E", "E", 18},
-		{matchesSheet, "F", "F", 52},
-		{matchesSheet, "G", "G", 16},
 		{runDetailsSheet, "A", "A", 24},
 		{runDetailsSheet, "B", "B", 30},
 		{runDetailsSheet, "C", "C", 22},
@@ -180,25 +175,6 @@ func firstLinkedInURL(person personCandidates) string {
 		return ""
 	}
 	return person.LinkedInCandidates[0].URL
-}
-
-func friendlyMatchDecision(value string) string {
-	switch value {
-	case "likely_match":
-		return "Likely Match"
-	case "possible_match":
-		return "Possible Match"
-	case "no_match_selected":
-		return "No Match"
-	case "unlikely_match":
-		return "Unlikely Match"
-	case "insufficient_evidence":
-		return "Insufficient Evidence"
-	case "baseline_unverified":
-		return "LinkedIn Not Verified"
-	default:
-		return value
-	}
 }
 
 func friendlyMatchStatus(value string) string {
